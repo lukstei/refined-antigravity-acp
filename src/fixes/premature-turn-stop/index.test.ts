@@ -6,7 +6,12 @@ import {
   type AcpStreamMessage,
 } from "../../core/types.js";
 import { createMockContext } from "../../test-utils/e2e-harness.js";
-import { buildContinuationText, createPrematureTurnStopFix } from "./index.js";
+import {
+  buildContinuationText,
+  createPrematureTurnStopFix,
+  extractUserPromptText,
+  isStopIntent,
+} from "./index.js";
 
 function makeToolCallUpdate(
   sessionId: string,
@@ -402,5 +407,303 @@ describe("premature-turn-stop reproduction and verification", () => {
     // Properly detected text, no continuation dispatched
     expect(result).toEqual([normalResult]);
     expect(writtenToChild).toHaveLength(0);
+  });
+
+  it("solution: prompt containing system instructions with 'wait' does not suppress continuation", async () => {
+    const fix = createPrematureTurnStopFix();
+    const context = createMockContext();
+    const writtenToChild: AcpStreamMessage[] = [];
+    context.writeToChild = vi.fn().mockImplementation(async (msg) => {
+      writtenToChild.push(msg);
+    });
+
+    // Prompt includes system instructions containing the word "wait" and "stop"
+    await fix.onOutbound?.(
+      {
+        jsonrpc: "2.0",
+        id: 808,
+        method: ACP_METHODS.SESSION_PROMPT,
+        params: {
+          sessionId,
+          prompt: [
+            {
+              type: "text",
+              text: "System instructions (replace earlier instructions). Please wait for settlement before dispatching.",
+            },
+            {
+              type: "text",
+              text: "<skills>If task matches skill, do not stop without loading.</skills>",
+            },
+            {
+              type: "text",
+              text: "Refactor database migrations",
+            },
+          ],
+        },
+      } as unknown as AcpStreamMessage,
+      context,
+    );
+
+    await fix.onInbound?.(makeToolCall(sessionId, "call_808", "Migrate db"), context);
+    await fix.onInbound?.(makeToolCallUpdate(sessionId, "call_808", "completed"), context);
+
+    // Empty stopReason end_turn
+    const emptyResult = makePromptResult(808, STOP_REASONS.END_TURN);
+    const intercepted = await fix.onInbound?.(emptyResult, context);
+
+    // Should NOT be suppressed by the word "wait" in host instructions
+    expect(intercepted).toEqual([]);
+    expect(writtenToChild).toHaveLength(1);
+    expect(
+      (writtenToChild[0] as unknown as { params: { prompt: Array<{ text: string }> } }).params
+        .prompt[0]?.text,
+    ).toContain("[Automated Continuation]");
+  });
+
+  it("solution: triggers continuation when tools are emitted via tool_call_update only", async () => {
+    const fix = createPrematureTurnStopFix();
+    const context = createMockContext();
+    const writtenToChild: AcpStreamMessage[] = [];
+    context.writeToChild = vi.fn().mockImplementation(async (msg) => {
+      writtenToChild.push(msg);
+    });
+
+    await fix.onOutbound?.(
+      {
+        jsonrpc: "2.0",
+        id: 909,
+        method: ACP_METHODS.SESSION_PROMPT,
+        params: {
+          sessionId,
+          prompt: [{ type: "text", text: "Run lint" }],
+        },
+      } as unknown as AcpStreamMessage,
+      context,
+    );
+
+    // Tool call emitted ONLY as tool_call_update (no tool_call notification)
+    await fix.onInbound?.(
+      makeToolCallUpdate(sessionId, "call_909", "completed", "ESLint"),
+      context,
+    );
+
+    const emptyResult = makePromptResult(909, STOP_REASONS.END_TURN);
+    const intercepted = await fix.onInbound?.(emptyResult, context);
+
+    expect(intercepted).toEqual([]);
+    expect(writtenToChild).toHaveLength(1);
+  });
+
+  it("solution: synthesizes fallback status message when continuations are exhausted without assistant text", async () => {
+    const fix = createPrematureTurnStopFix({ maxContinuations: 1 });
+    const context = createMockContext();
+    const writtenToChild: AcpStreamMessage[] = [];
+    context.writeToChild = vi.fn().mockImplementation(async (msg) => {
+      writtenToChild.push(msg);
+    });
+
+    await fix.onOutbound?.(
+      {
+        jsonrpc: "2.0",
+        id: 1010,
+        method: ACP_METHODS.SESSION_PROMPT,
+        params: {
+          sessionId,
+          prompt: [{ type: "text", text: "Run complex job" }],
+        },
+      } as unknown as AcpStreamMessage,
+      context,
+    );
+
+    await fix.onInbound?.(makeToolCall(sessionId, "call_1010", "Job"), context);
+    await fix.onInbound?.(makeToolCallUpdate(sessionId, "call_1010", "completed"), context);
+
+    // 1. Initial empty completion triggers continuation 1
+    const emptyResult = makePromptResult(1010, STOP_REASONS.END_TURN);
+    const intercepted = await fix.onInbound?.(emptyResult, context);
+    expect(intercepted).toEqual([]);
+    expect(writtenToChild).toHaveLength(1);
+
+    // 2. Upstream finishes continuation 1 with 0 text again (maxContinuations=1 reached)
+    const continuationPromptId = (writtenToChild[0] as unknown as { id: string }).id;
+    const continuationResult = makePromptResult(continuationPromptId, STOP_REASONS.END_TURN);
+    const finalResult = await fix.onInbound?.(continuationResult, context);
+
+    // Should synthesize fallback agent_message_chunk so client does not fail with ACP_NO_VISIBLE_RESPONSE
+    expect(finalResult).toHaveLength(2);
+    expect(finalResult?.[0]).toMatchObject({
+      jsonrpc: "2.0",
+      method: ACP_METHODS.SESSION_UPDATE,
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: SESSION_UPDATES.AGENT_MESSAGE_CHUNK,
+          content: {
+            type: "text",
+            text: expect.stringContaining("Completed 1 tool action(s)"),
+          },
+        },
+      },
+    });
+    expect(finalResult?.[1]).toMatchObject({
+      jsonrpc: "2.0",
+      id: 1010,
+      result: { stopReason: STOP_REASONS.END_TURN },
+    });
+  });
+
+  it("solution: drops duplicate turn completion events while continuation prompt is in flight, avoiding concurrent prompt dispatch", async () => {
+    const fix = createPrematureTurnStopFix({ maxContinuations: 2 });
+    const context = createMockContext();
+    const writtenToChild: AcpStreamMessage[] = [];
+    context.writeToChild = vi.fn().mockImplementation(async (msg) => {
+      writtenToChild.push(msg);
+    });
+
+    await fix.onOutbound?.(
+      {
+        jsonrpc: "2.0",
+        id: 2001,
+        method: ACP_METHODS.SESSION_PROMPT,
+        params: {
+          sessionId,
+          prompt: [{ type: "text", text: "Run background task" }],
+        },
+      } as unknown as AcpStreamMessage,
+      context,
+    );
+
+    await fix.onInbound?.(makeToolCall(sessionId, "call_2001", "Grep"), context);
+    await fix.onInbound?.(makeToolCallUpdate(sessionId, "call_2001", "completed"), context);
+
+    // 1. First empty endTurn arrives
+    const emptyResult1 = makePromptResult(2001, STOP_REASONS.END_TURN);
+    const intercepted1 = await fix.onInbound?.(emptyResult1, context);
+    expect(intercepted1).toEqual([]);
+    expect(writtenToChild).toHaveLength(1);
+
+    // 2. Immediate duplicate empty endTurn arrives (e.g. within 2ms from settlement or race)
+    const emptyResult2 = makePromptResult(2001, STOP_REASONS.END_TURN);
+    const intercepted2 = await fix.onInbound?.(emptyResult2, context);
+    // Must be dropped completely!
+    expect(intercepted2).toEqual([]);
+    // Crucially: no second continuation prompt dispatched!
+    expect(writtenToChild).toHaveLength(1);
+
+    // 3. Now continuation finishes with assistant text
+    const contId = (writtenToChild[0] as unknown as { id: string }).id;
+    await fix.onInbound?.(makeMessageChunk(sessionId, "Task summary here."), context);
+    const finalResult = await fix.onInbound?.(
+      makePromptResult(contId, STOP_REASONS.END_TURN),
+      context,
+    );
+
+    expect(finalResult).toHaveLength(1);
+    expect(finalResult?.[0]).toMatchObject({
+      jsonrpc: "2.0",
+      id: 2001,
+      result: { stopReason: STOP_REASONS.END_TURN },
+    });
+  });
+
+  it("solution: intercepts continuation RPC errors, synthesizes fallback message and returns end_turn mapped to original prompt id", async () => {
+    const fix = createPrematureTurnStopFix({ maxContinuations: 2 });
+    const context = createMockContext();
+    const writtenToChild: AcpStreamMessage[] = [];
+    context.writeToChild = vi.fn().mockImplementation(async (msg) => {
+      writtenToChild.push(msg);
+    });
+
+    await fix.onOutbound?.(
+      {
+        jsonrpc: "2.0",
+        id: 3001,
+        method: ACP_METHODS.SESSION_PROMPT,
+        params: {
+          sessionId,
+          prompt: [{ type: "text", text: "Failing continuation turn" }],
+        },
+      } as unknown as AcpStreamMessage,
+      context,
+    );
+
+    await fix.onInbound?.(makeToolCall(sessionId, "call_3001", "Grep"), context);
+    await fix.onInbound?.(makeToolCallUpdate(sessionId, "call_3001", "completed"), context);
+
+    // Empty stop triggers continuation
+    const emptyResult = makePromptResult(3001, STOP_REASONS.END_TURN);
+    const intercepted = await fix.onInbound?.(emptyResult, context);
+    expect(intercepted).toEqual([]);
+    expect(writtenToChild).toHaveLength(1);
+
+    const contId = (writtenToChild[0] as unknown as { id: string }).id;
+
+    // Upstream returns JSON-RPC error for the continuation prompt
+    const rpcError: AcpStreamMessage = {
+      jsonrpc: "2.0",
+      id: contId,
+      error: {
+        code: -32603,
+        message: "A foreground turn is already active",
+      },
+    };
+
+    const errorResult = await fix.onInbound?.(rpcError, context);
+    // Should synthesize fallback message chunk and resolve original prompt cleanly
+    expect(errorResult).toHaveLength(2);
+    expect(errorResult?.[0]).toMatchObject({
+      jsonrpc: "2.0",
+      method: ACP_METHODS.SESSION_UPDATE,
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: SESSION_UPDATES.AGENT_MESSAGE_CHUNK,
+          content: {
+            type: "text",
+            text: expect.stringContaining(
+              "Completed 1 tool action(s), but continuation encountered an error",
+            ),
+          },
+        },
+      },
+    });
+    expect(errorResult?.[1]).toMatchObject({
+      jsonrpc: "2.0",
+      id: 3001,
+      result: {
+        stopReason: STOP_REASONS.END_TURN,
+      },
+    });
+  });
+  describe("isStopIntent and extractUserPromptText", () => {
+    it("recognizes short imperative stop commands", () => {
+      expect(isStopIntent("stop")).toBe(true);
+      expect(isStopIntent("Stop!")).toBe(true);
+      expect(isStopIntent("  stop  ")).toBe(true);
+      expect(isStopIntent("halt")).toBe(true);
+      expect(isStopIntent("pause")).toBe(true);
+      expect(isStopIntent("hold on")).toBe(true);
+      expect(isStopIntent("Stop and give me a status report")).toBe(true);
+    });
+
+    it("rejects non-stop queries and instructions mentioning wait or stop", () => {
+      expect(isStopIntent("Refactor database migrations")).toBe(false);
+      expect(isStopIntent("Please wait for deployment to complete")).toBe(false);
+      expect(isStopIntent("Do not stop without summarizing progress")).toBe(false);
+      expect(
+        isStopIntent(
+          "Stop doing the previous migration refactor and instead create a new schema from scratch with users, roles, permissions, audit logs, and tenants tables.",
+        ),
+      ).toBe(false);
+    });
+
+    it("extractUserPromptText extracts trailing user text block from multi-block prompts", () => {
+      const prompt = [
+        { type: "text", text: "Host instructions: do not stop until complete." },
+        { type: "text", text: "<skills>catalog</skills>" },
+        { type: "text", text: "Run lint check" },
+      ];
+      expect(extractUserPromptText(prompt)).toBe("Run lint check");
+    });
   });
 });
