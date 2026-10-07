@@ -1187,4 +1187,75 @@ describe("prompt settlement during background tasks", () => {
     expect(lateResponse).toEqual([]);
     fix.dispose?.();
   });
+
+  it("does not synthesize prompt settlement when synchronous tools complete in STATE_IDLE without background tasks", async () => {
+    const fix = createBackgroundTasksFix();
+    const sessionId = "sess_sync_tool";
+    const forwarded: AcpStreamMessage[] = [];
+    const inboundContext: InboundContext = {
+      ...dummyInboundContext,
+      forwardInbound: (msg: AcpStreamMessage) => forwarded.push(msg),
+    };
+    const stderrContext = {
+      forwardInbound: (msg: AcpStreamMessage) => forwarded.push(msg),
+    } as unknown as StderrContext;
+
+    // 1. Client sends a prompt
+    fix.onOutbound?.(
+      {
+        jsonrpc: "2.0",
+        id: 501,
+        method: "session/prompt",
+        params: { sessionId, prompt: [] },
+      } as unknown as AcpStreamMessage,
+      { ...inboundContext } as unknown as OutboundContext,
+    );
+
+    // 2. Synchronous tool call starts
+    await fix.onInbound?.(
+      {
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: "tool_call",
+            toolCallId: "call_rg_1",
+            title: "grep",
+          },
+        },
+      } as unknown as AcpStreamMessage,
+      inboundContext,
+    );
+
+    // 3. Tool call completes
+    await fix.onInbound?.(
+      {
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: "tool_call_update",
+            toolCallId: "call_rg_1",
+            status: "completed",
+          },
+        },
+      } as unknown as AcpStreamMessage,
+      inboundContext,
+    );
+
+    // 4. Engine transitions to STATE_IDLE (waiting for next model step)
+    fix.onStderrLine?.(
+      `RAW WS MSG: {"trajectoryStateUpdate":{"trajectoryId":"${sessionId}","state":"STATE_IDLE"}}`,
+      stderrContext,
+    );
+
+    // Wait past settlement window (80ms)
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    // Must NOT emit synthetic end_turn settlement; agent turn is still active
+    expect(forwarded).toEqual([]);
+    fix.dispose?.();
+  });
 });
