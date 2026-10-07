@@ -190,6 +190,10 @@ export class StreamSanitizer {
   private harnessStack: string[] = [];
   private buffer = "";
   private inBackgroundTask = false;
+  private inCodeFence = false;
+  private fenceLength = 3;
+  private inInlineCode = false;
+  private inlineDelimiterLength = 1;
 
   get inHarnessTag(): boolean {
     return this.harnessStack.length > 0;
@@ -199,6 +203,169 @@ export class StreamSanitizer {
     this.harnessStack = [];
     this.buffer = "";
     this.inBackgroundTask = false;
+    this.inCodeFence = false;
+    this.fenceLength = 3;
+    this.inInlineCode = false;
+    this.inlineDelimiterLength = 1;
+  }
+
+  private processInCodeFence(input: string): { output: string; remainder: string } {
+    const partialMatch = input.match(/(?:^|\n)[ \t]{0,3}`+$/);
+    if (partialMatch && partialMatch.index !== undefined) {
+      this.buffer = input.slice(partialMatch.index);
+      return {
+        output: input.slice(0, partialMatch.index),
+        remainder: "",
+      };
+    }
+
+    const fenceRegex = new RegExp(`(?:^|\\n)[ \\t]{0,3}\`{${this.fenceLength},}[ \\t]*(?:\\n|$)`);
+    const match = input.match(fenceRegex);
+    if (match && match.index !== undefined) {
+      const endIdx = match.index + match[0].length;
+      this.inCodeFence = false;
+      return {
+        output: input.slice(0, endIdx),
+        remainder: input.slice(endIdx),
+      };
+    }
+
+    return {
+      output: input,
+      remainder: "",
+    };
+  }
+
+  private processInInlineCode(input: string): { output: string; remainder: string } {
+    const blankLineIdx = input.indexOf("\n\n");
+    const delimRegex = new RegExp(`(?<!\`)\`{${this.inlineDelimiterLength}}(?!\`)`);
+    const match = input.match(delimRegex);
+
+    if (blankLineIdx !== -1 && (!match || blankLineIdx < (match.index ?? 0))) {
+      this.inInlineCode = false;
+      return {
+        output: input.slice(0, blankLineIdx),
+        remainder: input.slice(blankLineIdx),
+      };
+    }
+
+    if (match && match.index !== undefined) {
+      const endIdx = match.index + this.inlineDelimiterLength;
+      this.inInlineCode = false;
+      return {
+        output: input.slice(0, endIdx),
+        remainder: input.slice(endIdx),
+      };
+    }
+
+    const trailing = input.match(/`+$/);
+    if (trailing && trailing.index !== undefined) {
+      this.buffer = input.slice(trailing.index);
+      return {
+        output: input.slice(0, trailing.index),
+        remainder: "",
+      };
+    }
+
+    return {
+      output: input,
+      remainder: "",
+    };
+  }
+
+  private handleBacktick(
+    input: string,
+    output: string,
+  ): { output: string; remainder: string; buffered: boolean } {
+    if (/^`+$/.test(input)) {
+      this.buffer = input;
+      return { output: "", remainder: "", buffered: true };
+    }
+
+    const isLineStart = output.length === 0 || /(?:^|\n)[ \t]{0,3}$/.test(output);
+    const fenceMatch = input.match(/^(`{3,})[^\r\n`]*(?:\r?\n|$)/);
+
+    if (isLineStart && fenceMatch && fenceMatch[1]) {
+      this.inCodeFence = true;
+      this.fenceLength = fenceMatch[1].length;
+      return {
+        output: fenceMatch[0],
+        remainder: input.slice(fenceMatch[0].length),
+        buffered: false,
+      };
+    }
+
+    const inlineMatch = input.match(/^(`+)/);
+    if (inlineMatch && inlineMatch[1]) {
+      this.inInlineCode = true;
+      this.inlineDelimiterLength = inlineMatch[1].length;
+      return {
+        output: inlineMatch[0],
+        remainder: input.slice(inlineMatch[0].length),
+        buffered: false,
+      };
+    }
+
+    return { output: input[0] ?? "", remainder: input.slice(1), buffered: false };
+  }
+
+  private handleLtTag(input: string): { text: string; remainder: string; buffered: boolean } {
+    const gtIdx = input.indexOf(">");
+    if (gtIdx === -1) {
+      if (isPossibleHarnessPrefix(input)) {
+        this.buffer = input;
+        return { text: "", remainder: "", buffered: true };
+      }
+      return { text: input[0] ?? "", remainder: input.slice(1), buffered: false };
+    }
+    const res = this.handleFullTag(input, gtIdx);
+    return { text: res.text, remainder: res.remainder, buffered: false };
+  }
+
+  private processActiveState(input: string): { output: string; remainder: string } | null {
+    if (this.inHarnessTag) {
+      return { output: "", remainder: this.processInHarness(input) };
+    }
+    if (this.inBackgroundTask) {
+      return { output: "", remainder: this.processInBackgroundTask(input) };
+    }
+    if (this.inCodeFence) {
+      return this.processInCodeFence(input);
+    }
+    if (this.inInlineCode) {
+      return this.processInInlineCode(input);
+    }
+    return null;
+  }
+
+  private processNextToken(
+    input: string,
+    output: string,
+  ): { output: string; remainder: string; buffered: boolean } {
+    const ltIdx = input.indexOf("<");
+    const btIdx = input.indexOf("`");
+
+    if (ltIdx === -1 && btIdx === -1) {
+      return { output: input, remainder: "", buffered: false };
+    }
+
+    if (btIdx !== -1 && (ltIdx === -1 || btIdx < ltIdx)) {
+      const prefix = input.slice(0, btIdx);
+      const res = this.handleBacktick(input.slice(btIdx), output + prefix);
+      return {
+        output: prefix + res.output,
+        remainder: res.remainder,
+        buffered: res.buffered,
+      };
+    }
+
+    const prefix = input.slice(0, ltIdx);
+    const res = this.handleLtTag(input.slice(ltIdx));
+    return {
+      output: prefix + res.text,
+      remainder: res.remainder,
+      buffered: res.buffered,
+    };
   }
 
   process(chunk: string): string {
@@ -207,52 +374,25 @@ export class StreamSanitizer {
     let output = "";
 
     while (input.length > 0) {
-      if (this.inHarnessTag) {
-        input = this.processInHarness(input);
+      const active = this.processActiveState(input);
+      if (active) {
+        output += active.output;
+        input = active.remainder;
         continue;
       }
 
-      if (this.inBackgroundTask) {
-        input = this.processInBackgroundTask(input);
+      const banner = this.checkBannerOrSystemMessage(input);
+      if (banner.buffered) return output + banner.output;
+      if (banner.remainder !== input) {
+        output += banner.output;
+        input = banner.remainder;
         continue;
       }
 
-      const bannerCheck = this.checkBannerOrSystemMessage(input);
-      if (bannerCheck.buffered) {
-        output += bannerCheck.output;
-        break;
-      }
-      if (bannerCheck.remainder !== input) {
-        output += bannerCheck.output;
-        input = bannerCheck.remainder;
-        continue;
-      }
-
-      const ltIdx = input.indexOf("<");
-      if (ltIdx === -1) {
-        output += input;
-        break;
-      }
-
-      if (ltIdx > 0) {
-        output += input.slice(0, ltIdx);
-        input = input.slice(ltIdx);
-      }
-
-      const gtIdx = input.indexOf(">");
-      if (gtIdx === -1) {
-        if (isPossibleHarnessPrefix(input)) {
-          this.buffer = input;
-          break;
-        }
-        output += input[0];
-        input = input.slice(1);
-        continue;
-      }
-
-      const res = this.handleFullTag(input, gtIdx);
-      output += res.text;
-      input = res.remainder;
+      const token = this.processNextToken(input, output);
+      output += token.output;
+      if (token.buffered) return output;
+      input = token.remainder;
     }
 
     return output;

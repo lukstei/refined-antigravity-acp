@@ -75,6 +75,81 @@ describe("StreamSanitizer", () => {
     output += sanitizer.flush();
     expect(output).toBe(raw);
   });
+
+  it("preserves harness tag names inside inline code spans without swallowing subsequent text", () => {
+    const sanitizer = new StreamSanitizer();
+    const raw =
+      "* **Antigravity System Prompt (`<artifacts>`):\n  * Upstream Antigravity explicitly specifies:\n    All artifacts should be written to the artifact directory.";
+    const result = sanitizer.process(raw) + sanitizer.flush();
+    expect(result).toBe(raw);
+  });
+
+  it("preserves harness tags inside fenced code blocks", () => {
+    const sanitizer = new StreamSanitizer();
+    const raw = "```xml\n<artifacts>\n  <item />\n</artifacts>\n```\nVisible text.";
+    const result = sanitizer.process(raw) + sanitizer.flush();
+    expect(result).toBe(raw);
+  });
+
+  it("preserves harness tags inside fenced code blocks and strips them outside", () => {
+    const sanitizer = new StreamSanitizer();
+    const raw =
+      "```xml\n<artifacts>\n  <item />\n</artifacts>\n```\n<artifacts>leaked tag outside fence</artifacts>Visible text.";
+    const result = sanitizer.process(raw) + sanitizer.flush();
+    expect(result).toBe("```xml\n<artifacts>\n  <item />\n</artifacts>\n```\nVisible text.");
+  });
+
+  it("preserves harness tags inside fenced code blocks when streamed char-by-char", () => {
+    const sanitizer = new StreamSanitizer();
+    const raw =
+      "```xml\n<artifacts>\n  <item />\n</artifacts>\n```\n<artifacts>leaked tag outside fence</artifacts>Visible text.";
+    let output = "";
+    for (const ch of raw) {
+      output += sanitizer.process(ch);
+    }
+    output += sanitizer.flush();
+    expect(output).toBe("```xml\n<artifacts>\n  <item />\n</artifacts>\n```\nVisible text.");
+  });
+
+  it("preserves harness tags inside fenced code blocks containing blank lines", () => {
+    const sanitizer = new StreamSanitizer();
+    const raw = "```xml\n<artifacts>\n\n  <item />\n\n</artifacts>\n```\nVisible text.";
+    const result = sanitizer.process(raw) + sanitizer.flush();
+    expect(result).toBe(raw);
+  });
+
+  it("preserves harness tags when code fence backticks are split across chunks", () => {
+    const sanitizer = new StreamSanitizer();
+    const chunks = [
+      "`",
+      "``xml\n<artifacts>\n",
+      "\n  <item />\n\n",
+      "</artifacts>\n`",
+      "``\n<artifacts>leak</artifacts>Visible text.",
+    ];
+    let output = "";
+    for (const chunk of chunks) {
+      output += sanitizer.process(chunk);
+    }
+    output += sanitizer.flush();
+    expect(output).toBe("```xml\n<artifacts>\n\n  <item />\n\n</artifacts>\n```\nVisible text.");
+  });
+
+  it("preserves inline code harness tags streamed across small chunks", () => {
+    const sanitizer = new StreamSanitizer();
+    const chunks = [
+      "* **Antigravity System Prompt (`",
+      "<artifacts>",
+      "`):\n",
+      "  * Important analysis continues here without truncation.",
+    ];
+    let output = "";
+    for (const chunk of chunks) {
+      output += sanitizer.process(chunk);
+    }
+    output += sanitizer.flush();
+    expect(output).toBe(chunks.join(""));
+  });
 });
 
 describe("streamSanitizationFix", () => {
