@@ -33,6 +33,7 @@ export function stripSteeringPrefix(text: string): string {
 
 export const FOREGROUND_TURN_ERROR_PATTERN = /foreground turn is already active/i;
 export const DONE_CH_ERROR_PATTERN = new RegExp(DONE_CH_PANIC_MARKER, "i");
+export const SESSION_NOT_FOUND_PATTERN = /session not found/i;
 export const MAX_PROMPT_RETRIES = 5;
 export const DEFAULT_PROMPT_RETRY_DELAY_MS = 500;
 
@@ -47,11 +48,12 @@ interface PendingRetryItem {
   recycled?: boolean;
 }
 
-function parsePromptError(msg: AcpStreamMessage): { isDoneCh: boolean } | null {
-  if (!("error" in msg) || !msg.error || typeof msg.error.message !== "string") return null;
-  const text = msg.error.message;
-  if (DONE_CH_ERROR_PATTERN.test(text)) return { isDoneCh: true };
-  if (FOREGROUND_TURN_ERROR_PATTERN.test(text)) return { isDoneCh: false };
+function parsePromptError(msg: AcpStreamMessage): { needsRecovery: boolean } | null {
+  if (!("error" in msg) || !msg.error) return null;
+  const text = JSON.stringify(msg.error);
+  if (DONE_CH_ERROR_PATTERN.test(text) || SESSION_NOT_FOUND_PATTERN.test(text))
+    return { needsRecovery: true };
+  if (FOREGROUND_TURN_ERROR_PATTERN.test(text)) return { needsRecovery: false };
   return null;
 }
 
@@ -99,17 +101,17 @@ function schedulePromptRetry(
 async function handlePromptRetryOrRecovery(
   msgId: string | number,
   pending: PendingRetryItem,
-  isDoneCh: boolean,
+  needsRecovery: boolean,
   delayMs: number,
   maxRetries: number,
   context: InboundContext,
 ): Promise<boolean> {
-  if (isDoneCh) {
+  if (needsRecovery) {
     await handleSessionRecovery(pending.msg, context);
   }
 
   if (pending.attempts >= maxRetries) {
-    if (!isDoneCh && !pending.recycled) {
+    if (!needsRecovery && !pending.recycled) {
       pending.recycled = true;
       pending.attempts = 0;
       console.warn(
@@ -123,7 +125,7 @@ async function handlePromptRetryOrRecovery(
   }
 
   pending.attempts += 1;
-  schedulePromptRetry(msgId, pending, isDoneCh ? 0 : delayMs, context);
+  schedulePromptRetry(msgId, pending, needsRecovery ? 0 : delayMs, context);
   return true;
 }
 
@@ -179,7 +181,7 @@ export function createActiveTurnCollisionFix(options?: UserSteeringOptions): Acp
       const retried = await handlePromptRetryOrRecovery(
         msg.id,
         pending,
-        parsed.isDoneCh,
+        parsed.needsRecovery,
         delayMs,
         maxRetries,
         context,
