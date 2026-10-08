@@ -9,8 +9,6 @@ import { createMockContext } from "../../test-utils/e2e-harness.js";
 import {
   buildContinuationText,
   createPrematureTurnStopFix,
-  extractUserPromptText,
-  isStopIntent,
 } from "./index.js";
 
 function makeToolCallUpdate(
@@ -330,7 +328,7 @@ describe("premature-turn-stop reproduction and verification", () => {
     expect(writtenToChild).toHaveLength(0);
   });
 
-  it("solution: does not trigger continuation when user explicitly asked to stop even after tool calls", async () => {
+  it("solution: does not trigger continuation when session was cancelled via session/cancel", async () => {
     const fix = createPrematureTurnStopFix();
     const context = createMockContext();
     const writtenToChild: AcpStreamMessage[] = [];
@@ -345,7 +343,7 @@ describe("premature-turn-stop reproduction and verification", () => {
         method: ACP_METHODS.SESSION_PROMPT,
         params: {
           sessionId,
-          prompt: [{ type: "text", text: "Stop and give me a status report" }],
+          prompt: [{ type: "text", text: "Some prompt" }],
         },
       } as unknown as AcpStreamMessage,
       context,
@@ -355,8 +353,18 @@ describe("premature-turn-stop reproduction and verification", () => {
     await fix.onInbound?.(makeToolCall(sessionId, "call_stop_1", "Tool 1"), context);
     await fix.onInbound?.(makeToolCallUpdate(sessionId, "call_stop_1", "completed"), context);
 
-    // Turn completes
-    const stopResult = makePromptResult(606, "end_turn");
+    // Client cancels session
+    await fix.onOutbound?.(
+      {
+        jsonrpc: "2.0",
+        method: ACP_METHODS.SESSION_CANCEL,
+        params: { sessionId },
+      } as unknown as AcpStreamMessage,
+      context,
+    );
+
+    // Turn completes with cancelled
+    const stopResult = makePromptResult(606, STOP_REASONS.CANCELLED);
     const result = await fix.onInbound?.(stopResult, context);
 
     expect(result).toEqual([stopResult]);
@@ -675,35 +683,110 @@ describe("premature-turn-stop reproduction and verification", () => {
       },
     });
   });
-  describe("isStopIntent and extractUserPromptText", () => {
-    it("recognizes short imperative stop commands", () => {
-      expect(isStopIntent("stop")).toBe(true);
-      expect(isStopIntent("Stop!")).toBe(true);
-      expect(isStopIntent("  stop  ")).toBe(true);
-      expect(isStopIntent("halt")).toBe(true);
-      expect(isStopIntent("pause")).toBe(true);
-      expect(isStopIntent("hold on")).toBe(true);
-      expect(isStopIntent("Stop and give me a status report")).toBe(true);
+  it("solution: multi-round continuation executes subsequent round when first continuation halts prematurely", async () => {
+    const fix = createPrematureTurnStopFix({ maxContinuations: 2 });
+    const context = createMockContext();
+    const writtenToChild: AcpStreamMessage[] = [];
+    context.writeToChild = vi.fn().mockImplementation(async (msg) => {
+      writtenToChild.push(msg);
     });
 
-    it("rejects non-stop queries and instructions mentioning wait or stop", () => {
-      expect(isStopIntent("Refactor database migrations")).toBe(false);
-      expect(isStopIntent("Please wait for deployment to complete")).toBe(false);
-      expect(isStopIntent("Do not stop without summarizing progress")).toBe(false);
-      expect(
-        isStopIntent(
-          "Stop doing the previous migration refactor and instead create a new schema from scratch with users, roles, permissions, audit logs, and tenants tables.",
-        ),
-      ).toBe(false);
-    });
+    await fix.onOutbound?.(
+      {
+        jsonrpc: "2.0",
+        id: 4001,
+        method: ACP_METHODS.SESSION_PROMPT,
+        params: {
+          sessionId,
+          prompt: [{ type: "text", text: "Multi-round task" }],
+        },
+      } as unknown as AcpStreamMessage,
+      context,
+    );
 
-    it("extractUserPromptText extracts trailing user text block from multi-block prompts", () => {
-      const prompt = [
-        { type: "text", text: "Host instructions: do not stop until complete." },
-        { type: "text", text: "<skills>catalog</skills>" },
-        { type: "text", text: "Run lint check" },
-      ];
-      expect(extractUserPromptText(prompt)).toBe("Run lint check");
+    await fix.onInbound?.(makeToolCall(sessionId, "call_4001", "Step 1"), context);
+    await fix.onInbound?.(makeToolCallUpdate(sessionId, "call_4001", "completed"), context);
+
+    // Initial empty stop triggers continuation 1
+    const initialResult = makePromptResult(4001, STOP_REASONS.END_TURN);
+    const intercepted1 = await fix.onInbound?.(initialResult, context);
+    expect(intercepted1).toEqual([]);
+    expect(writtenToChild).toHaveLength(1);
+
+    const cont1Id = (writtenToChild[0] as unknown as { id: string }).id;
+
+    // Continuation 1 executes another tool call, but also halts with empty text
+    await fix.onInbound?.(makeToolCall(sessionId, "call_4002", "Step 2"), context);
+    await fix.onInbound?.(makeToolCallUpdate(sessionId, "call_4002", "completed"), context);
+
+    const cont1Result = makePromptResult(cont1Id, STOP_REASONS.END_TURN);
+    const intercepted2 = await fix.onInbound?.(cont1Result, context);
+
+    // Must trigger continuation 2 (maxContinuations=2)
+    expect(intercepted2).toEqual([]);
+    expect(writtenToChild).toHaveLength(2);
+
+    const cont2Id = (writtenToChild[1] as unknown as { id: string }).id;
+    expect(cont2Id).not.toEqual(cont1Id);
+
+    // Continuation 2 completes with assistant text
+    await fix.onInbound?.(makeMessageChunk(sessionId, "All steps finished."), context);
+    const finalResult = await fix.onInbound?.(
+      makePromptResult(cont2Id, STOP_REASONS.END_TURN),
+      context,
+    );
+
+    expect(finalResult).toHaveLength(1);
+    expect(finalResult?.[0]).toMatchObject({
+      jsonrpc: "2.0",
+      id: 4001,
+      result: { stopReason: STOP_REASONS.END_TURN },
+    });
+  });
+
+  it("solution: synthesizes fallback status chunk when continuation dispatch throws", async () => {
+    const fix = createPrematureTurnStopFix({ maxContinuations: 2 });
+    const context = createMockContext();
+    context.writeToChild = vi.fn().mockRejectedValue(new Error("Pipe closed"));
+
+    await fix.onOutbound?.(
+      {
+        jsonrpc: "2.0",
+        id: 5001,
+        method: ACP_METHODS.SESSION_PROMPT,
+        params: {
+          sessionId,
+          prompt: [{ type: "text", text: "Failing dispatch" }],
+        },
+      } as unknown as AcpStreamMessage,
+      context,
+    );
+
+    await fix.onInbound?.(makeToolCall(sessionId, "call_5001", "Grep"), context);
+    await fix.onInbound?.(makeToolCallUpdate(sessionId, "call_5001", "completed"), context);
+
+    const emptyResult = makePromptResult(5001, STOP_REASONS.END_TURN);
+    const result = await fix.onInbound?.(emptyResult, context);
+
+    expect(result).toHaveLength(2);
+    expect(result?.[0]).toMatchObject({
+      jsonrpc: "2.0",
+      method: ACP_METHODS.SESSION_UPDATE,
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: SESSION_UPDATES.AGENT_MESSAGE_CHUNK,
+          content: {
+            type: "text",
+            text: expect.stringContaining("Completed 1 tool action(s)"),
+          },
+        },
+      },
+    });
+    expect(result?.[1]).toMatchObject({
+      jsonrpc: "2.0",
+      id: 5001,
+      result: { stopReason: STOP_REASONS.END_TURN },
     });
   });
 });
