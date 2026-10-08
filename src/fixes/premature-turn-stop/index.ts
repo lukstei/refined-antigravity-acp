@@ -46,30 +46,9 @@ export function extractContentText(content: unknown): string {
   return extractBlockText(content);
 }
 
-export function extractUserPromptText(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    for (let i = content.length - 1; i >= 0; i--) {
-      const text = extractBlockText(content[i]).trim();
-      if (text) {
-        return text;
-      }
-    }
-  }
-  return extractContentText(content).trim();
-}
-
-const STOP_INTENT_PATTERN = /^\s*(?:stop|halt|pause|hold\s+on)(?:[\s!.,:;-]|$)/i;
-
-export function isStopIntent(text: string): boolean {
-  const trimmed = text.trim();
-  return trimmed.length < 50 && STOP_INTENT_PATTERN.test(trimmed);
-}
-
 interface SessionTurnState {
   activePromptId?: string | number | null | undefined;
   continuationPromptId?: string | number | undefined;
-  userAskedToStop: boolean;
   toolCallCount: number;
   seenToolCallIds: Set<string>;
   assistantTextLength: number;
@@ -88,7 +67,6 @@ export class PrematureTurnStopTracker {
     let state = this.sessions.get(sessionId);
     if (!state) {
       state = {
-        userAskedToStop: false,
         toolCallCount: 0,
         seenToolCallIds: new Set(),
         assistantTextLength: 0,
@@ -99,14 +77,16 @@ export class PrematureTurnStopTracker {
     return state;
   }
 
-  startTurn(sessionId: string, promptId?: string | number | null, userAskedToStop = false): void {
+  startTurn(sessionId: string, promptId?: string | number | null): void {
     const state = this.getOrCreate(sessionId);
+    if (state.activePromptId !== undefined && state.activePromptId !== null) {
+      this.promptIdToSessionId.delete(state.activePromptId);
+    }
     if (state.continuationPromptId !== undefined) {
       this.promptIdToSessionId.delete(state.continuationPromptId);
     }
     state.activePromptId = promptId;
     state.continuationPromptId = undefined;
-    state.userAskedToStop = userAskedToStop;
     state.toolCallCount = 0;
     state.seenToolCallIds.clear();
     state.assistantTextLength = 0;
@@ -134,33 +114,6 @@ export class PrematureTurnStopTracker {
     state.assistantTextLength += length;
   }
 
-  isPrematureStop(
-    sessionId: string,
-    promptId: string | number | null | undefined,
-    maxContinuations: number,
-  ): boolean {
-    const state = this.sessions.get(sessionId);
-    if (!state || state.continuationPromptId !== undefined) return false;
-    if (state.activePromptId === undefined || state.activePromptId === null) return false;
-
-    return (
-      state.activePromptId === promptId &&
-      !state.userAskedToStop &&
-      state.toolCallCount > 0 &&
-      state.assistantTextLength === 0 &&
-      state.continuationCount < maxContinuations
-    );
-  }
-
-  incrementContinuationCount(sessionId: string): void {
-    const s = this.sessions.get(sessionId);
-    if (s) s.continuationCount++;
-  }
-
-  isContinuationInFlight(sessionId: string): boolean {
-    return this.sessions.get(sessionId)?.continuationPromptId !== undefined;
-  }
-
   registerContinuationPrompt(sessionId: string, continuationPromptId: string | number): void {
     const s = this.sessions.get(sessionId);
     if (s) {
@@ -175,10 +128,6 @@ export class PrematureTurnStopTracker {
       this.promptIdToSessionId.delete(s.continuationPromptId);
       s.continuationPromptId = undefined;
     }
-  }
-
-  getActivePromptId(sessionId: string): string | number | null | undefined {
-    return this.sessions.get(sessionId)?.activePromptId;
   }
 
   clearSession(sessionId: string): void {
@@ -226,14 +175,12 @@ async function dispatchContinuationPrompt(
   tracker: PrematureTurnStopTracker,
   context: InboundContext,
 ): Promise<boolean> {
-  const originalPromptId = tracker.getActivePromptId(sessionId);
-  if (originalPromptId === undefined || originalPromptId === null) return false;
+  const state = tracker.get(sessionId);
+  if (!state || state.activePromptId === undefined || state.activePromptId === null) return false;
 
-  tracker.incrementContinuationCount(sessionId);
-  const toolCallCount = tracker.get(sessionId)?.toolCallCount ?? 0;
-  const continuationText = buildContinuationText(toolCallCount);
-
-  const continuationPromptId = `continue_${sessionId}_${Date.now()}`;
+  state.continuationCount++;
+  const continuationText = buildContinuationText(state.toolCallCount);
+  const continuationPromptId = `continue_${sessionId}_${Date.now()}_${state.continuationCount}`;
   tracker.registerContinuationPrompt(sessionId, continuationPromptId);
   if (context.sessionCache) {
     trackPendingRequestSession(context.sessionCache, continuationPromptId, sessionId);
@@ -276,15 +223,16 @@ function handleInboundUpdate(
     "params" in msg ? (msg.params as SessionUpdateParams | undefined)?.update : undefined;
   if (!update) return;
 
-  if (
-    update.sessionUpdate === SESSION_UPDATES.TOOL_CALL ||
-    update.sessionUpdate === SESSION_UPDATES.TOOL_CALL_UPDATE
-  ) {
+  if (update.sessionUpdate === SESSION_UPDATES.TOOL_CALL) {
     const toolCallId =
       typeof (update as { toolCallId?: unknown }).toolCallId === "string"
         ? (update as { toolCallId: string }).toolCallId
         : undefined;
     tracker.recordToolCall(sessionId, toolCallId);
+  } else if (update.sessionUpdate === SESSION_UPDATES.TOOL_CALL_UPDATE) {
+    if (typeof (update as { toolCallId?: unknown }).toolCallId === "string") {
+      tracker.recordToolCall(sessionId, (update as { toolCallId: string }).toolCallId);
+    }
   } else if (update.sessionUpdate === SESSION_UPDATES.AGENT_MESSAGE_CHUNK) {
     const text = extractContentText(update.content);
     if (text.trim().length > 0) {
@@ -293,28 +241,9 @@ function handleInboundUpdate(
   }
 }
 
-function handleContinuationResponse(
-  msg: AcpStreamMessage,
-  promptId: string | number | null | undefined,
-  sessionId: string,
-  tracker: PrematureTurnStopTracker,
-): AcpStreamMessage[] | null {
-  if (promptId === undefined || promptId === null) return null;
-  const state = tracker.get(sessionId);
-  if (state?.continuationPromptId !== undefined && state.continuationPromptId === promptId) {
-    const originalPromptId = state.activePromptId;
-    tracker.clearContinuationPrompt(sessionId);
-    return [{ ...msg, id: originalPromptId ?? null }];
-  }
-  return null;
-}
-
 function extractErrorMessage(error: unknown): string {
-  if (typeof error === "object" && error !== null && "message" in error) {
-    const msg = (error as { message?: unknown }).message;
-    return typeof msg === "string" ? msg : "upstream error";
-  }
-  return "upstream error";
+  const msg = (error as { message?: unknown } | null)?.message;
+  return typeof msg === "string" ? msg : "upstream error";
 }
 
 function handlePromptError(
@@ -323,17 +252,11 @@ function handlePromptError(
   tracker: PrematureTurnStopTracker,
 ): AcpStreamMessage[] | null {
   if (!("error" in msg) || !msg.error) return null;
-  const promptId = (msg as { id?: string | number | null }).id;
-  if (promptId === undefined || promptId === null) return null;
-
   const state = tracker.get(sessionId);
-  if (
-    !state ||
-    state.continuationPromptId === undefined ||
-    state.continuationPromptId !== promptId
-  ) {
-    return null;
-  }
+  if (!state?.continuationPromptId) return null;
+
+  const promptId = (msg as { id?: string | number }).id;
+  if (promptId !== state.continuationPromptId) return null;
 
   const originalPromptId = state.activePromptId;
   const toolCallCount = state.toolCallCount;
@@ -347,24 +270,60 @@ function handlePromptError(
   const syntheticResult: AcpStreamMessage = {
     jsonrpc: "2.0",
     id: originalPromptId ?? null,
-    result: {
-      stopReason: STOP_REASONS.END_TURN,
-    },
+    result: { stopReason: STOP_REASONS.END_TURN },
   };
   return [fallbackChunk, syntheticResult];
 }
 
-function isStaleDuplicateCompletion(
-  tracker: PrematureTurnStopTracker,
+function synthesizeFallbackResult(
   sessionId: string,
-  promptId: string | number | null | undefined,
-): boolean {
-  return (
-    tracker.isContinuationInFlight(sessionId) &&
-    promptId !== undefined &&
-    promptId !== null &&
-    promptId === tracker.getActivePromptId(sessionId)
+  state: SessionTurnState,
+  tracker: PrematureTurnStopTracker,
+): AcpStreamMessage[] {
+  const toolCallCount = state.toolCallCount;
+  const originalPromptId = state.activePromptId;
+  tracker.clearSession(sessionId);
+  const fallbackChunk = createFallbackChunk(
+    sessionId,
+    `[Completed ${toolCallCount} tool action(s), but no concluding summary was provided by the agent.]`,
   );
+  const syntheticResult: AcpStreamMessage = {
+    jsonrpc: "2.0",
+    id: originalPromptId ?? null,
+    result: { stopReason: STOP_REASONS.END_TURN },
+  };
+  return [fallbackChunk, syntheticResult];
+}
+
+async function handlePrematureStop(
+  sessionId: string,
+  state: SessionTurnState,
+  isContinuationResponse: boolean,
+  tracker: PrematureTurnStopTracker,
+  context: InboundContext,
+  maxContinuations: number,
+): Promise<AcpStreamMessage[]> {
+  if (state.continuationCount < maxContinuations) {
+    if (isContinuationResponse) {
+      tracker.clearContinuationPrompt(sessionId);
+    }
+    const dispatched = await dispatchContinuationPrompt(sessionId, tracker, context);
+    if (dispatched) return [];
+  }
+  return synthesizeFallbackResult(sessionId, state, tracker);
+}
+
+function classifyPrompt(
+  state: SessionTurnState,
+  promptId: string | number | null | undefined,
+): "duplicate" | "continuation" | "original" | "ignore" {
+  if (promptId === undefined || promptId === null) return "ignore";
+  if (state.continuationPromptId !== undefined) {
+    if (promptId === state.activePromptId) return "duplicate";
+    if (promptId === state.continuationPromptId) return "continuation";
+    return "ignore";
+  }
+  return promptId === state.activePromptId ? "original" : "ignore";
 }
 
 function isCancelledStop(stopReason: unknown): boolean {
@@ -375,46 +334,20 @@ function isEndTurnStop(stopReason: unknown): boolean {
   return stopReason === STOP_REASONS.END_TURN || stopReason === "endTurn";
 }
 
-async function maybeDispatchContinuation(
-  sessionId: string,
-  promptId: string | number | null | undefined,
-  isEndTurn: boolean,
-  tracker: PrematureTurnStopTracker,
-  context: InboundContext,
-  maxContinuations: number,
-): Promise<boolean> {
-  if (isEndTurn && tracker.isPrematureStop(sessionId, promptId, maxContinuations)) {
-    return dispatchContinuationPrompt(sessionId, tracker, context);
-  }
-  return false;
+function shouldContinue(stopReason: unknown, state: SessionTurnState): boolean {
+  if (!isEndTurnStop(stopReason)) return false;
+  return state.toolCallCount > 0 && state.assistantTextLength === 0;
 }
 
-function finalizeContinuationResponse(
-  continuationResponse: AcpStreamMessage[],
-  sessionId: string,
-  isEndTurn: boolean,
+function resolveContinuationResult(
+  msg: AcpStreamMessage,
+  state: SessionTurnState,
   tracker: PrematureTurnStopTracker,
+  sessionId: string,
 ): AcpStreamMessage[] {
-  const state = tracker.get(sessionId);
-  const needsFallback =
-    isEndTurn &&
-    state &&
-    state.assistantTextLength === 0 &&
-    state.toolCallCount > 0 &&
-    !state.userAskedToStop;
-
-  if (needsFallback) {
-    const toolCallCount = state.toolCallCount;
-    tracker.clearSession(sessionId);
-    const fallbackChunk = createFallbackChunk(
-      sessionId,
-      `[Completed ${toolCallCount} tool action(s), but no concluding summary was provided by the agent.]`,
-    );
-    return [fallbackChunk, ...continuationResponse];
-  }
-
+  const originalPromptId = state.activePromptId;
   tracker.clearSession(sessionId);
-  return continuationResponse;
+  return [{ ...msg, id: originalPromptId ?? null }];
 }
 
 async function handlePromptResult(
@@ -426,35 +359,39 @@ async function handlePromptResult(
 ): Promise<AcpStreamMessage[] | null> {
   if (!("result" in msg)) return null;
 
-  const promptId = (msg as { id?: string | number | null }).id;
   const res = msg.result as Record<string, unknown> | null;
   const stopReason = res?.stopReason;
-
   if (isCancelledStop(stopReason)) {
     tracker.clearSession(sessionId);
     return null;
   }
 
-  if (isStaleDuplicateCompletion(tracker, sessionId, promptId)) {
-    return [];
+  const state = tracker.get(sessionId);
+  if (!state) return null;
+
+  const promptId = (msg as { id?: string | number | null }).id;
+  const kind = classifyPrompt(state, promptId);
+  if (kind === "duplicate") return [];
+  if (kind === "ignore") return null;
+
+  const isContinuation = kind === "continuation";
+  if (shouldContinue(stopReason, state)) {
+    const maxContinuations = options.maxContinuations ?? 2;
+    return handlePrematureStop(
+      sessionId,
+      state,
+      isContinuation,
+      tracker,
+      context,
+      maxContinuations,
+    );
   }
 
-  const isEndTurn = isEndTurnStop(stopReason);
-  const continuationDispatched = await maybeDispatchContinuation(
-    sessionId,
-    promptId,
-    isEndTurn,
-    tracker,
-    context,
-    options.maxContinuations ?? 2,
-  );
-  if (continuationDispatched) return [];
-
-  const continuationResponse = handleContinuationResponse(msg, promptId, sessionId, tracker);
-  if (continuationResponse) {
-    return finalizeContinuationResponse(continuationResponse, sessionId, isEndTurn, tracker);
+  if (isContinuation) {
+    return resolveContinuationResult(msg, state, tracker, sessionId);
   }
 
+  tracker.clearSession(sessionId);
   return null;
 }
 
@@ -469,7 +406,6 @@ export function createPrematureTurnStopFix(options: PrematureTurnStopOptions = {
     getSystemInstructions(): readonly string[] {
       return [
         "Never end a prompt turn without emitting a clear assistant text message summarizing completed actions, current status, or next steps.",
-        "When executing commit commands, linter checks, or tests that encounter errors, explicitly explain the failures to the user before attempting further autonomous repairs.",
       ];
     },
 
@@ -479,10 +415,7 @@ export function createPrematureTurnStopFix(options: PrematureTurnStopOptions = {
 
       if (isMethod(msg, ACP_METHODS.SESSION_PROMPT)) {
         const promptId = (msg as { id?: string | number }).id;
-        const promptBlocks = (msg as { params?: { prompt?: unknown } })?.params?.prompt;
-        const userText = extractUserPromptText(promptBlocks);
-        const askedToStop = isStopIntent(userText);
-        tracker.startTurn(sessionId, promptId, askedToStop);
+        tracker.startTurn(sessionId, promptId);
       } else if (
         isMethod(msg, ACP_METHODS.SESSION_CANCEL) ||
         isMethod(msg, ACP_METHODS.SESSION_CLOSE) ||
