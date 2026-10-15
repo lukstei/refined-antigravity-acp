@@ -4,7 +4,7 @@ import type { ChildProcess } from "node:child_process";
 import { ACP_METHODS, SESSION_UPDATES, STOP_REASONS, type AcpStreamMessage } from "./types.js";
 import { AcpPipeline } from "./pipeline.js";
 import { ProcessSupervisor } from "./supervisor.js";
-import { getOrCreateSession } from "./session-cache.js";
+import { createSessionCache, getOrCreateSession } from "./session-cache.js";
 
 function createMockChild(): {
   child: ChildProcess;
@@ -544,6 +544,105 @@ describe("ProcessSupervisor", () => {
     // No synthetic end_turn should be emitted by default
     const syntheticResponses = forwarded.filter((m) => "id" in m && m.id === 105 && "result" in m);
     expect(syntheticResponses).toHaveLength(0);
+
+    await reader.cancel();
+    supervisor.close();
+  });
+
+  it("flags session for recycling when upstream emits agent connection lost chunk and recycles on next prompt", async () => {
+    const { child: initialChild } = createMockChild();
+    const forwarded: AcpStreamMessage[] = [];
+    const { child: recycledChild } = createMockChild();
+
+    const cache = createSessionCache();
+    const supervisor = new ProcessSupervisor({
+      cmd: "mock-agy",
+      args: [],
+      initialChild,
+      pipeline: new AcpPipeline([]),
+      sessionCache: cache,
+      spawnProcess: () => recycledChild,
+    });
+
+    const streams = supervisor.createStreams();
+    const reader = streams.readable.getReader();
+    void (async () => {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) forwarded.push(value);
+      }
+    })();
+
+    // 1. Allocate session
+    await supervisor.handleOutbound({
+      jsonrpc: "2.0",
+      id: 201,
+      method: ACP_METHODS.SESSION_NEW,
+      params: { cwd: "/tmp" },
+    } as unknown as AcpStreamMessage);
+    await supervisor.handleStdoutLine(
+      JSON.stringify({ jsonrpc: "2.0", id: 201, result: { sessionId: "session-conn-lost" } }),
+    );
+
+    // 2. Upstream emits agent connection lost chunk
+    await supervisor.handleStdoutLine(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        method: ACP_METHODS.SESSION_UPDATE,
+        params: {
+          sessionId: "session-conn-lost",
+          update: {
+            sessionUpdate: SESSION_UPDATES.AGENT_MESSAGE_CHUNK,
+            content: {
+              type: "text",
+              text: "Agent connection was lost and could not be re-established: Failed to rebuild agent: received 1000 (OK); then sent 1000 (OK)",
+            },
+          },
+        },
+      }),
+    );
+
+    // Verify session is marked for recycling
+    const session = cache.sessions.get("session-conn-lost");
+    expect(session?.needsRecycle).toBe(true);
+
+    // 3. Client sends next prompt -> triggers process recycling
+    let recycledChildReceivedInit = false;
+    const handleRecycledChildStdin = async (line: string) => {
+      const msg = JSON.parse(line) as { id?: string | number; method?: string };
+      if (msg.id === "__refined_agy_recycle_init") {
+        recycledChildReceivedInit = true;
+        await supervisor.handleStdoutLine(
+          JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: {} }),
+        );
+      } else if (msg.id === "__refined_agy_recycle_load") {
+        await supervisor.handleStdoutLine(
+          JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: {} }),
+        );
+      }
+    };
+
+    recycledChild.stdin?.on("data", (chunk: Buffer) => {
+      const lines = chunk.toString("utf-8").split("\n").filter(Boolean);
+      for (const line of lines) {
+        void handleRecycledChildStdin(line);
+      }
+    });
+
+    await supervisor.handleOutbound({
+      jsonrpc: "2.0",
+      id: 301,
+      method: ACP_METHODS.SESSION_PROMPT,
+      params: {
+        sessionId: "session-conn-lost",
+        prompt: [{ type: "text", text: "Next prompt" }],
+      },
+    } as unknown as AcpStreamMessage);
+
+    // Process recycling must have been triggered for the new prompt
+    expect(recycledChildReceivedInit).toBe(true);
+    expect(session?.needsRecycle).toBe(false);
 
     await reader.cancel();
     supervisor.close();
