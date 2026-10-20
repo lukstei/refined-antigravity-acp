@@ -12,6 +12,7 @@ import { noisyStderrLogsFix } from "./noisy-stderr-logs/index.js";
 import { nonCanonicalModeIdsFix } from "./non-canonical-mode-ids/index.js";
 import { silentBackgroundTasksFix } from "./silent-background-tasks/index.js";
 import { cancellationLeakFix } from "./cancellation-leak/index.js";
+import { missingUsageMetricsFix } from "./missing-usage-metrics/index.js";
 import { danglingToolCallsFix } from "./dangling-tool-calls/index.js";
 import { missingQuestionFallbackFix } from "./missing-question-fallback/index.js";
 import { prematureTurnStopFix } from "./premature-turn-stop/index.js";
@@ -67,6 +68,7 @@ export function createDefaultFixes(): AcpFix[] {
     flattenedModelEffortsFix,
     gatedThirdPartyModelsFix,
     nonCanonicalModeIdsFix,
+    missingUsageMetricsFix,
     missingQuestionFallbackFix,
     prematureTurnStopFix,
   ];
