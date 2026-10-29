@@ -32,6 +32,7 @@ export interface AntigravityConnectorOptions {
   /** Delay between failed respawn attempts. */
   recycleRetryDelayMs?: number;
   promptSettlementTimeoutMs?: number;
+  customDbPathGetter?: (sessionId: string) => string;
 }
 
 /**
@@ -60,6 +61,7 @@ export function createAntigravityConnector(
       recycleSpawnAttempts: options?.recycleSpawnAttempts,
       recycleRetryDelayMs: options?.recycleRetryDelayMs,
       promptSettlementTimeoutMs: options?.promptSettlementTimeoutMs,
+      customDbPathGetter: options?.customDbPathGetter,
     });
 
     return supervisor.createStreams();

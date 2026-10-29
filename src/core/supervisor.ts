@@ -1,3 +1,4 @@
+import { existsSync, statSync } from "node:fs";
 import type { ChildProcess } from "node:child_process";
 import readline from "node:readline";
 import {
@@ -34,6 +35,7 @@ import {
 } from "./session-cache.js";
 
 import { defaultSpawnProcess, traceAcp, writeJsonMessage } from "./transport.js";
+import { getConversationDbPath } from "../fixes/orphaned-checkpoints/index.js";
 
 export {
   RECYCLE_ID_PREFIX,
@@ -43,10 +45,30 @@ export {
   RECYCLE_CONFIG_PREFIX,
 };
 
-const DEFAULT_RECYCLE_TIMEOUT_MS = 60_000;
-const DEFAULT_RECYCLE_SPAWN_ATTEMPTS = 3;
-const DEFAULT_RECYCLE_RETRY_DELAY_MS = 500;
-const DEFAULT_PROMPT_SETTLE_TIMEOUT_MS = 0;
+export const DEFAULT_RECYCLE_TIMEOUT_MS = 180_000;
+export const DEFAULT_RECYCLE_SPAWN_ATTEMPTS = 3;
+export const DEFAULT_RECYCLE_RETRY_DELAY_MS = 500;
+export const DEFAULT_PROMPT_SETTLE_TIMEOUT_MS = 0;
+export const LOAD_TIMEOUT_PER_MB_MS = 500;
+
+export function computeSessionLoadTimeout(
+  sessionId: string,
+  baseTimeoutMs: number = DEFAULT_RECYCLE_TIMEOUT_MS,
+  customDbPath?: string,
+): number {
+  try {
+    const dbPath = customDbPath ?? getConversationDbPath(sessionId);
+    if (existsSync(dbPath)) {
+      const stats = statSync(dbPath);
+      const sizeMb = stats.size / (1024 * 1024);
+      const additionalMs = Math.round(sizeMb * LOAD_TIMEOUT_PER_MB_MS);
+      return Math.max(baseTimeoutMs, baseTimeoutMs + additionalMs);
+    }
+  } catch {
+    // If db stats cannot be read, fall back to base timeout
+  }
+  return baseTimeoutMs;
+}
 
 function parseEnvMs(val: string | undefined, defaultMs: number): number {
   if (!val) return defaultMs;
@@ -122,6 +144,7 @@ export interface SupervisorOptions {
   recycleRetryDelayMs?: number | undefined;
   /** Watchdog timeout in ms to synthesize terminal prompt response when upstream hangs after usage_update. */
   promptSettlementTimeoutMs?: number | undefined;
+  customDbPathGetter?: ((sessionId: string) => string) | undefined;
 }
 
 export class ProcessSupervisor implements CoreContext {
@@ -139,11 +162,13 @@ export class ProcessSupervisor implements CoreContext {
   private readonly recycleSpawnAttempts: number;
   private readonly recycleRetryDelayMs: number;
   private readonly promptSettlementTimeoutMs: number;
+  private readonly customDbPathGetter?: ((sessionId: string) => string) | undefined;
   private readonly promptSettlementTimers = new Map<string, NodeJS.Timeout>();
   private readonly activePrompts = new Map<string, string | number>();
   private readonly pendingRequests = new Map<string | number, PendingInternalRequest>();
   private readonly suppressedResponseIds = new Set<string | number>();
   private activeRecycle: Promise<void> | null = null;
+  private inboundQueue: Promise<void> = Promise.resolve();
   private rlOut: readline.Interface | null = null;
   private rlErr: readline.Interface | null = null;
   private readableController: ReadableStreamDefaultController<AcpStreamMessage> | null = null;
@@ -170,6 +195,7 @@ export class ProcessSupervisor implements CoreContext {
         process.env.REFINED_AGY_PROMPT_SETTLE_TIMEOUT_MS,
         DEFAULT_PROMPT_SETTLE_TIMEOUT_MS,
       );
+    this.customDbPathGetter = options.customDbPathGetter;
 
     this.baseContext = {
       sessionCache: this.sessionCache,
@@ -613,6 +639,25 @@ export class ProcessSupervisor implements CoreContext {
     await this.dispatchInboundPipeline(msg, sessionId, context);
   }
 
+  /**
+   * Handles child stdout lines one at a time. Inbound fixes settle at different
+   * speeds, so concurrent handling lets a prompt result overtake the updates
+   * emitted before it. Lines received while recycling bypass the queue: inbound
+   * fixes may await a recycle, which needs the new child's internal replies, and
+   * every other line is dropped while recycling anyway.
+   */
+  private enqueueStdoutLine(line: string): void {
+    const handle = (): Promise<void> =>
+      this.handleStdoutLine(line).catch((err) => {
+        console.error("[refined-antigravity-acp] Error in handleStdoutLine:", err);
+      });
+    if (this.isRecycling) {
+      void handle();
+      return;
+    }
+    this.inboundQueue = this.inboundQueue.then(handle);
+  }
+
   handleStderrLine(line: string): void {
     const suppressed = this.pipeline.applyStderrLine(line, this.stderrContext);
     if (!suppressed) {
@@ -623,11 +668,7 @@ export class ProcessSupervisor implements CoreContext {
   private bindChild(child: ChildProcess): void {
     if (child.stdout) {
       this.rlOut = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
-      this.rlOut.on("line", (line) => {
-        this.handleStdoutLine(line).catch((err) => {
-          console.error("[refined-antigravity-acp] Error in handleStdoutLine:", err);
-        });
-      });
+      this.rlOut.on("line", (line) => this.enqueueStdoutLine(line));
     }
 
     if (child.stderr) {
@@ -690,7 +731,15 @@ export class ProcessSupervisor implements CoreContext {
     } as unknown as AcpStreamMessage;
 
     const transformedLoad = await this.pipeline.applyOutbound(loadMsg, context);
-    await this.sendInternalRequest(transformedLoad ?? loadMsg);
+    const customDbPath = this.customDbPathGetter
+      ? this.customDbPathGetter(session.sessionId)
+      : undefined;
+    const loadTimeoutMs = computeSessionLoadTimeout(
+      session.sessionId,
+      this.recycleTimeoutMs,
+      customDbPath,
+    );
+    await this.sendInternalRequest(transformedLoad ?? loadMsg, loadTimeoutMs);
   }
 
   private async resyncSessionMode(

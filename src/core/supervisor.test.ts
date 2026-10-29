@@ -1,9 +1,23 @@
 import { describe, expect, it } from "vitest";
 import { PassThrough } from "node:stream";
 import type { ChildProcess } from "node:child_process";
-import { ACP_METHODS, SESSION_UPDATES, STOP_REASONS, type AcpStreamMessage } from "./types.js";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  ACP_METHODS,
+  SESSION_UPDATES,
+  STOP_REASONS,
+  type AcpFix,
+  type AcpStreamMessage,
+} from "./types.js";
 import { AcpPipeline } from "./pipeline.js";
-import { ProcessSupervisor } from "./supervisor.js";
+import {
+  ProcessSupervisor,
+  computeSessionLoadTimeout,
+  DEFAULT_RECYCLE_TIMEOUT_MS,
+  LOAD_TIMEOUT_PER_MB_MS,
+} from "./supervisor.js";
 import { createSessionCache, getOrCreateSession } from "./session-cache.js";
 
 function createMockChild(): {
@@ -549,6 +563,115 @@ describe("ProcessSupervisor", () => {
     supervisor.close();
   });
 
+  it("solution: forwards child stdout lines in emission order when inbound fixes settle out of order", async () => {
+    const { child, stdout } = createMockChild();
+    const forwarded: AcpStreamMessage[] = [];
+
+    // Inbound fixes typically spend longer on session/update than on responses.
+    const slowUpdates: AcpFix = {
+      name: "slow-updates",
+      onInbound: async (msg) => {
+        if ("method" in msg) await new Promise((resolve) => setTimeout(resolve, 20));
+        return [msg];
+      },
+    };
+
+    const supervisor = new ProcessSupervisor({
+      cmd: "mock-agy",
+      args: [],
+      initialChild: child,
+      pipeline: new AcpPipeline([slowUpdates]),
+    });
+
+    const streams = supervisor.createStreams();
+    const reader = streams.readable.getReader();
+    void (async () => {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) forwarded.push(value);
+      }
+    })();
+
+    const chunk = {
+      jsonrpc: "2.0",
+      method: ACP_METHODS.SESSION_UPDATE,
+      params: {
+        sessionId: "session-order",
+        update: {
+          sessionUpdate: SESSION_UPDATES.AGENT_MESSAGE_CHUNK,
+          content: { type: "text", text: "answer" },
+        },
+      },
+    };
+    const result = { jsonrpc: "2.0", id: 7, result: { stopReason: STOP_REASONS.END_TURN } };
+    stdout.write(JSON.stringify(chunk) + "\n" + JSON.stringify(result) + "\n");
+
+    await new Promise((resolve) => setTimeout(resolve, 60));
+
+    // The prompt result must not overtake the text that preceded it.
+    expect(forwarded).toEqual([chunk, result]);
+
+    await reader.cancel();
+    supervisor.close();
+  });
+
+  it("solution: recycle replies bypass the stdout queue while an inbound fix awaits a recycle", async () => {
+    const { child: initialChild, stdout } = createMockChild();
+    const { child: recycledChild, stdout: recycledStdout } = createMockChild();
+    const forwarded: AcpStreamMessage[] = [];
+    const cache = createSessionCache();
+    const session = getOrCreateSession(cache, "session-recover");
+
+    const recoverOnFailure: AcpFix = {
+      name: "recover-on-failure",
+      onInbound: async (msg) => {
+        if ("error" in msg) await supervisor.triggerRecycle(session);
+        return [msg];
+      },
+    };
+
+    const supervisor = new ProcessSupervisor({
+      cmd: "mock-agy",
+      args: [],
+      initialChild,
+      pipeline: new AcpPipeline([recoverOnFailure]),
+      sessionCache: cache,
+      spawnProcess: () => recycledChild,
+      recycleTimeoutMs: 500,
+      recycleSpawnAttempts: 1,
+    });
+
+    recycledChild.stdin?.on("data", (data: Buffer) => {
+      for (const line of data.toString("utf-8").split("\n").filter(Boolean)) {
+        const msg = JSON.parse(line) as { id?: string | number };
+        recycledStdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: {} }) + "\n");
+      }
+    });
+
+    const streams = supervisor.createStreams();
+    const reader = streams.readable.getReader();
+    void (async () => {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) forwarded.push(value);
+      }
+    })();
+
+    const failure = { jsonrpc: "2.0", id: 8, error: { code: -32603, message: "busy" } };
+    stdout.write(JSON.stringify(failure) + "\n");
+
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    expect(supervisor.currentChild).toBe(recycledChild);
+    expect(supervisor.isClosed).toBe(false);
+    expect(forwarded).toEqual([failure]);
+
+    await reader.cancel();
+    supervisor.close();
+  });
+
   it("flags session for recycling when upstream emits agent connection lost chunk and recycles on next prompt", async () => {
     const { child: initialChild } = createMockChild();
     const forwarded: AcpStreamMessage[] = [];
@@ -646,5 +769,82 @@ describe("ProcessSupervisor", () => {
 
     await reader.cancel();
     supervisor.close();
+  });
+
+  describe("computeSessionLoadTimeout", () => {
+    it("returns baseTimeoutMs when database file does not exist", () => {
+      const timeout = computeSessionLoadTimeout(
+        "non-existent-session",
+        60_000,
+        "/tmp/does-not-exist-at-all.db",
+      );
+      expect(timeout).toBe(60_000);
+    });
+
+    it("dynamically scales timeout based on conversation DB file size", () => {
+      const testDir = join(tmpdir(), `test-db-scale-${Date.now()}`);
+      mkdirSync(testDir, { recursive: true });
+      const testDb = join(testDir, "test-sess.db");
+      const buffer = Buffer.alloc(10 * 1024 * 1024);
+      writeFileSync(testDb, buffer);
+
+      try {
+        const timeout = computeSessionLoadTimeout("test-sess", 60_000, testDb);
+        // 10 MB * 500 ms = 5,000 ms additional timeout
+        expect(timeout).toBe(65_000);
+      } finally {
+        rmSync(testDir, { recursive: true, force: true });
+      }
+    });
+
+    it("uses default 180s base timeout when baseTimeoutMs is omitted", () => {
+      const timeout = computeSessionLoadTimeout("non-existent-session");
+      expect(timeout).toBe(DEFAULT_RECYCLE_TIMEOUT_MS);
+      expect(timeout).toBe(180_000);
+      expect(LOAD_TIMEOUT_PER_MB_MS).toBe(500);
+    });
+  });
+
+  it("solution: triggerRecycle computes session/load timeout using customDbPathGetter", async () => {
+    const { child: initialChild } = createMockChild();
+    const { child: recycledChild } = createMockChild();
+    const testDir = join(tmpdir(), `test-custom-db-${Date.now()}`);
+    mkdirSync(testDir, { recursive: true });
+    const dummyDb = join(testDir, "large-session.db");
+    writeFileSync(dummyDb, Buffer.alloc(20 * 1024 * 1024));
+
+    let queriedSessionId: string | null = null;
+    const supervisor = new ProcessSupervisor({
+      cmd: "mock-agy",
+      args: [],
+      initialChild,
+      pipeline: new AcpPipeline([]),
+      spawnProcess: () => recycledChild,
+      customDbPathGetter: (sid) => {
+        queriedSessionId = sid;
+        return dummyDb;
+      },
+    });
+
+    recycledChild.stdin?.on("data", (chunk: Buffer) => {
+      const lines = chunk.toString("utf-8").split("\n").filter(Boolean);
+      for (const line of lines) {
+        const msg = JSON.parse(line) as { id?: string | number };
+        if (msg.id) {
+          void supervisor.handleStdoutLine(
+            JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: {} }),
+          );
+        }
+      }
+    });
+
+    try {
+      const session = getOrCreateSession(supervisor.sessionCache, "large-session");
+      await supervisor.triggerRecycle(session);
+      expect(queriedSessionId).toBe("large-session");
+    } finally {
+      rmSync(testDir, { recursive: true, force: true });
+      supervisor.close();
+    }
   });
 });
